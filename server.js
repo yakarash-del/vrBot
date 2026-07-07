@@ -182,48 +182,110 @@ app.post("/api/tts", async (req, res) => {
 });
 
 // ---------- Speech-to-text (Whisper sidecar — free-speech input on Quest) ----------
-let sttWorker = null;
-let sttQueue = Promise.resolve();
-let sttResolvers = [];
+// Tries several Python launchers: on Windows, plain "python" is sometimes the
+// Microsoft Store stub (exits immediately) or a different install without
+// faster-whisper — "py" then reaches the real launcher.
+const PYTHON_CANDIDATES = process.env.PYTHON
+  ? [process.env.PYTHON]
+  : ["python", "py", "python3"];
 
-function getSttWorker() {
-  if (sttWorker) return sttWorker;
-  try {
-    sttWorker = spawn("python", [path.join(__dirname, "stt_worker.py")], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } catch {
-    return null;
-  }
+let sttProc = null;       // live, ready worker process
+let sttStarting = null;   // in-flight startup promise
+let sttResolvers = [];
+let sttQueue = Promise.resolve();
+
+function attachStdoutParser(proc) {
   let buffer = "";
-  let ready = false;
-  const readyPromise = new Promise((resolve, reject) => {
-    sttWorker.stdout.on("data", (chunk) => {
-      buffer += chunk.toString();
-      let idx;
-      while ((idx = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
-        if (!line) continue;
-        let msg;
-        try { msg = JSON.parse(line); } catch { continue; }
-        if (msg.ready && !ready) { ready = true; resolve(); continue; }
-        const resolver = sttResolvers.shift();
-        if (resolver) resolver(msg);
+  proc.stdout.on("data", (chunk) => {
+    buffer += chunk.toString();
+    let idx;
+    while ((idx = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, idx).trim();
+      buffer = buffer.slice(idx + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      if (msg.ready) { proc.emit("stt-ready"); continue; }
+      const resolver = sttResolvers.shift();
+      if (resolver) resolver(msg);
+    }
+  });
+}
+
+function trySpawnWorker(cmd) {
+  return new Promise((resolve, reject) => {
+    let proc;
+    try {
+      proc = spawn(cmd, [path.join(__dirname, "stt_worker.py")], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch (e) {
+      return reject(new Error(`${cmd}: ${e.message}`));
+    }
+    let stderrTail = "";
+    let settled = false;
+    proc.stderr.on("data", (c) => {
+      stderrTail = (stderrTail + c.toString()).slice(-2000);
+    });
+    attachStdoutParser(proc);
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        proc.kill();
+        reject(new Error(`${cmd}: המנוע לא נטען תוך 3 דקות`));
+      }
+    }, 180000);
+    proc.once("stt-ready", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(proc);
+    });
+    proc.on("error", (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`${cmd}: ${e.message}`));
+    });
+    proc.on("exit", (code) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        const hint = stderrTail.trim().split("\n").slice(-3).join(" | ");
+        reject(new Error(`${cmd} הסתיים מיד (קוד ${code})${hint ? ": " + hint : ""}`));
+      } else {
+        console.error(`מנוע התמלול קרס (קוד ${code}). פלט:\n${stderrTail}`);
+        sttProc = null;
+        for (const r of sttResolvers.splice(0)) r({ error: "מנוע התמלול קרס" });
       }
     });
-    sttWorker.on("error", reject);
-    sttWorker.on("exit", () => {
-      sttWorker = null;
-      if (!ready) reject(new Error("stt worker exited"));
-      for (const r of sttResolvers.splice(0)) r({ error: "worker exited" });
-    });
-    setTimeout(() => !ready && reject(new Error("stt worker timeout")), 120000);
   });
-  sttWorker.readyPromise = readyPromise;
-  sttWorker.stderr.on("data", () => {}); // model download progress — ignore
-  console.log("מפעיל מנוע תמלול (Whisper)...");
-  return sttWorker;
+}
+
+async function getSttWorker() {
+  if (sttProc) return sttProc;
+  if (!sttStarting) {
+    sttStarting = (async () => {
+      console.log("מפעיל מנוע תמלול (Whisper)...");
+      const errors = [];
+      for (const cmd of PYTHON_CANDIDATES) {
+        try {
+          const proc = await trySpawnWorker(cmd);
+          console.log(`מנוע התמלול מוכן (${cmd})`);
+          sttProc = proc;
+          return proc;
+        } catch (e) {
+          errors.push(e.message);
+          console.error("ניסיון הפעלת תמלול נכשל:", e.message);
+        }
+      }
+      throw new Error(
+        "לא נמצא Python עם faster-whisper. התקינו במחשב השרת: python -m pip install faster-whisper  (פירוט: " +
+          errors.join(" ; ") + ")"
+      );
+    })().finally(() => { sttStarting = null; });
+  }
+  return sttStarting;
 }
 
 app.post(
@@ -231,8 +293,13 @@ app.post(
   express.raw({ type: ["audio/*", "application/octet-stream"], limit: "20mb" }),
   async (req, res) => {
     if (!req.body?.length) return res.status(400).json({ error: "no audio" });
-    const worker = getSttWorker();
-    if (!worker) return res.status(503).json({ error: "תמלול לא זמין בשרת (נדרש Python)" });
+
+    let worker;
+    try {
+      worker = await getSttWorker();
+    } catch (e) {
+      return res.status(503).json({ error: "תמלול לא זמין: " + e.message });
+    }
 
     const tmpFile = path.join(
       os.tmpdir(),
@@ -243,7 +310,6 @@ app.post(
     // serialize requests — the worker answers strictly in order
     sttQueue = sttQueue.then(async () => {
       try {
-        await worker.readyPromise;
         const result = await new Promise((resolve) => {
           sttResolvers.push(resolve);
           worker.stdin.write(tmpFile + "\n");
