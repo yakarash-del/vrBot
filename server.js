@@ -1,9 +1,13 @@
+import { spawn } from "child_process";
+import crypto from "crypto";
 import express from "express";
 import fs from "fs";
 import http from "http";
 import https from "https";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import selfsigned from "selfsigned";
 import Anthropic from "@anthropic-ai/sdk";
 
@@ -79,7 +83,8 @@ function buildSystem() {
   const persona =
     `שמך ${config.name} ואתה דמות וירטואלית בחדר תלת-ממדי, מדבר עם מבקר שיושב מולך.\n` +
     `התרחיש וההוראות שלך:\n${config.instructions}\n` +
-    `כללים קבועים: ענה בעברית בלבד. ענה תשובות קצרות וממוקדות (2-4 משפטים) כי זו שיחה קולית. הישאר תמיד בדמות.`;
+    `כללים קבועים: ענה באותה שפה שבה המבקר פונה אליך - עברית, אנגלית או ערבית (ברירת המחדל עברית). ` +
+    `ענה תשובות קצרות וממוקדות (2-4 משפטים) כי זו שיחה קולית. הישאר תמיד בדמות.`;
   const blocks = [{ type: "text", text: persona }];
   if (config.background?.trim()) {
     blocks.push({
@@ -140,6 +145,123 @@ let demoIndex = 0;
 app.get("/api/usage", (_req, res) => {
   res.json({ ...budgetInfo(), requests: usage.requests, connected: HAS_CREDENTIALS });
 });
+
+// ---------- Text-to-speech (Edge neural voices — works on Quest too) ----------
+// Voice per language (detected from the reply text) and avatar gender.
+const TTS_VOICES = {
+  he: { male: "he-IL-AvriNeural", female: "he-IL-HilaNeural" },
+  ar: { male: "ar-SA-HamedNeural", female: "ar-SA-ZariyahNeural" },
+  en: { male: "en-US-GuyNeural", female: "en-US-JennyNeural" },
+};
+
+function detectLanguage(text) {
+  if (/[֐-׿]/.test(text)) return "he";
+  if (/[؀-ۿ]/.test(text)) return "ar";
+  return "en";
+}
+
+app.post("/api/tts", async (req, res) => {
+  const text = String(req.body?.text || "").slice(0, 1500);
+  if (!text.trim()) return res.status(400).json({ error: "text is required" });
+
+  const lang = detectLanguage(text);
+  const gender = config.avatar === "female" ? "female" : "male";
+  const voice = TTS_VOICES[lang][gender];
+
+  try {
+    const tts = new MsEdgeTTS();
+    await tts.setMetadata(voice, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+    const { audioStream } = await tts.toStream(text);
+    res.setHeader("Content-Type", "audio/mpeg");
+    audioStream.pipe(res);
+    audioStream.on("error", () => res.end());
+  } catch (error) {
+    console.error("TTS error:", error.message);
+    res.status(502).json({ error: "יצירת הקול נכשלה" });
+  }
+});
+
+// ---------- Speech-to-text (Whisper sidecar — free-speech input on Quest) ----------
+let sttWorker = null;
+let sttQueue = Promise.resolve();
+let sttResolvers = [];
+
+function getSttWorker() {
+  if (sttWorker) return sttWorker;
+  try {
+    sttWorker = spawn("python", [path.join(__dirname, "stt_worker.py")], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch {
+    return null;
+  }
+  let buffer = "";
+  let ready = false;
+  const readyPromise = new Promise((resolve, reject) => {
+    sttWorker.stdout.on("data", (chunk) => {
+      buffer += chunk.toString();
+      let idx;
+      while ((idx = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch { continue; }
+        if (msg.ready && !ready) { ready = true; resolve(); continue; }
+        const resolver = sttResolvers.shift();
+        if (resolver) resolver(msg);
+      }
+    });
+    sttWorker.on("error", reject);
+    sttWorker.on("exit", () => {
+      sttWorker = null;
+      if (!ready) reject(new Error("stt worker exited"));
+      for (const r of sttResolvers.splice(0)) r({ error: "worker exited" });
+    });
+    setTimeout(() => !ready && reject(new Error("stt worker timeout")), 120000);
+  });
+  sttWorker.readyPromise = readyPromise;
+  sttWorker.stderr.on("data", () => {}); // model download progress — ignore
+  console.log("מפעיל מנוע תמלול (Whisper)...");
+  return sttWorker;
+}
+
+app.post(
+  "/api/stt",
+  express.raw({ type: ["audio/*", "application/octet-stream"], limit: "20mb" }),
+  async (req, res) => {
+    if (!req.body?.length) return res.status(400).json({ error: "no audio" });
+    const worker = getSttWorker();
+    if (!worker) return res.status(503).json({ error: "תמלול לא זמין בשרת (נדרש Python)" });
+
+    const tmpFile = path.join(
+      os.tmpdir(),
+      `stt-${crypto.randomBytes(6).toString("hex")}.webm`
+    );
+    fs.writeFileSync(tmpFile, req.body);
+
+    // serialize requests — the worker answers strictly in order
+    sttQueue = sttQueue.then(async () => {
+      try {
+        await worker.readyPromise;
+        const result = await new Promise((resolve) => {
+          sttResolvers.push(resolve);
+          worker.stdin.write(tmpFile + "\n");
+        });
+        if (result.error) {
+          res.status(500).json({ error: "התמלול נכשל: " + result.error });
+        } else {
+          res.json({ text: result.text, language: result.language });
+        }
+      } catch (e) {
+        res.status(503).json({ error: "מנוע התמלול לא זמין: " + e.message });
+      } finally {
+        fs.unlink(tmpFile, () => {});
+      }
+    });
+    await sttQueue;
+  }
+);
 
 app.post("/api/chat", async (req, res) => {
   const { messages } = req.body;

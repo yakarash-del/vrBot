@@ -769,12 +769,53 @@ updateTtsButton();
 chatTts.addEventListener("click", () => {
   voiceEnabled = !voiceEnabled;
   localStorage.setItem("managerVoice", voiceEnabled ? "on" : "off");
-  if (!voiceEnabled) window.speechSynthesis?.cancel();
+  if (!voiceEnabled) stopVoice();
   updateTtsButton();
 });
 
-function speak(text) {
-  if (!voiceEnabled || !("speechSynthesis" in window)) {
+let currentAudio = null;
+
+function stopVoice() {
+  window.speechSynthesis?.cancel();
+  if (currentAudio) {
+    currentAudio.onended = null;
+    currentAudio.pause();
+    currentAudio = null;
+  }
+  isSpeaking = false;
+}
+
+// Primary voice: neural TTS generated on the server (works on Quest, supports
+// Hebrew / English / Arabic). Falls back to browser speechSynthesis, then to a
+// silent mouth animation.
+async function speak(text) {
+  if (!voiceEnabled) return;
+  stopVoice();
+  try {
+    const res = await fetch("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) throw new Error("tts " + res.status);
+    const url = URL.createObjectURL(await res.blob());
+    currentAudio = new Audio(url);
+    currentAudio.onplay = () => { isSpeaking = true; };
+    currentAudio.onended = () => {
+      isSpeaking = false;
+      URL.revokeObjectURL(url);
+      currentAudio = null;
+      autoListen(); // continuous-conversation mode: reopen the mic
+    };
+    currentAudio.onerror = () => { isSpeaking = false; };
+    await currentAudio.play();
+  } catch {
+    speakBrowser(text);
+  }
+}
+
+function speakBrowser(text) {
+  if (!("speechSynthesis" in window) || !(window.speechSynthesis.getVoices?.() || []).length) {
     talkingTimer = Math.min(7, 1.5 + text.length * 0.045);
     return;
   }
@@ -787,7 +828,7 @@ function speak(text) {
   utter.onstart = () => { isSpeaking = true; };
   utter.onend = () => {
     isSpeaking = false;
-    autoListen(); // continuous-conversation mode: reopen the mic
+    autoListen();
   };
   utter.onerror = () => {
     isSpeaking = false;
@@ -811,21 +852,35 @@ chatCont.addEventListener("click", () => {
 });
 
 function autoListen() {
-  if (!continuousMode || !recognition || listening || waiting || document.hidden) return;
+  if (!continuousMode || !HAS_VOICE_INPUT || listening || waiting || document.hidden) return;
   setTimeout(() => {
     if (!continuousMode || listening || waiting || isSpeaking) return;
-    try { recognition.start(); } catch { /* already starting */ }
+    startVoiceInput();
   }, 400);
 }
 
-// ---------- Voice input (speech recognition) ----------
+// ---------- Voice input ----------
+// Two paths: native SpeechRecognition (desktop Chrome/Edge — fast, streaming),
+// or MediaRecorder + server-side Whisper (Quest and any other browser).
 const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+const CAN_RECORD = Boolean(navigator.mediaDevices?.getUserMedia);
+const HAS_VOICE_INPUT = Boolean(SpeechRec || CAN_RECORD);
 let recognition = null;
 let listening = false;
 
+// language for native recognition (Whisper auto-detects on its own)
+const SR_LANGS = { he: "he-IL", en: "en-US", ar: "ar-SA" };
+let srLang = localStorage.getItem("managerLang") || "he";
+
+function setListeningUI(on, label) {
+  listening = on;
+  chatMic.classList.toggle("listening", on);
+  chatInput.placeholder = on ? (label || "מקשיב... דברו עכשיו") : "כתבו הודעה למנהל...";
+}
+
 if (SpeechRec) {
   recognition = new SpeechRec();
-  recognition.lang = "he-IL";
+  recognition.lang = SR_LANGS[srLang] || "he-IL";
   recognition.interimResults = true;
   recognition.continuous = false;
 
@@ -841,39 +896,139 @@ if (SpeechRec) {
       sendMessage(final);
     }
   };
-  recognition.onstart = () => {
-    listening = true;
-    chatMic.classList.add("listening");
-    chatInput.placeholder = "מקשיב... דברו עכשיו";
-  };
-  recognition.onend = () => {
-    listening = false;
-    chatMic.classList.remove("listening");
-    chatInput.placeholder = "כתבו הודעה למנהל...";
-  };
+  recognition.onstart = () => setListeningUI(true);
+  recognition.onend = () => setListeningUI(false);
   recognition.onerror = (e) => {
-    listening = false;
-    chatMic.classList.remove("listening");
-    chatInput.placeholder = "כתבו הודעה למנהל...";
+    setListeningUI(false);
     if (e.error === "not-allowed") {
       addHtmlMessage("system", "אין הרשאת מיקרופון. אשרו גישה למיקרופון בדפדפן.");
     } else if (e.error !== "no-speech" && e.error !== "aborted") {
       addHtmlMessage("system", "זיהוי הדיבור נכשל (" + e.error + "). נסו שוב.");
     }
   };
+}
 
-  chatMic.addEventListener("click", () => {
-    if (listening) {
-      recognition.stop();
+// --- Recorder path (Quest): record → auto-stop on silence → Whisper on server ---
+let mediaRecorder = null;
+let recStream = null;
+let vadCtx = null;
+
+async function startRecording() {
+  try {
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch {
+    addHtmlMessage("system", "אין הרשאת מיקרופון. אשרו גישה למיקרופון בדפדפן.");
+    return;
+  }
+  const chunks = [];
+  mediaRecorder = new MediaRecorder(recStream);
+  mediaRecorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  mediaRecorder.onstop = async () => {
+    cleanupRecording();
+    const blob = new Blob(chunks, { type: mediaRecorder.mimeType || "audio/webm" });
+    mediaRecorder = null;
+    if (blob.size < 2000) return; // too short — nothing was said
+    setListeningUI(false);
+    chatInput.placeholder = "מתמלל...";
+    try {
+      const res = await fetch("/api/stt", {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: blob,
+      });
+      const data = await res.json();
+      chatInput.placeholder = "כתבו הודעה למנהל...";
+      if (!res.ok) {
+        addHtmlMessage("system", data.error || "התמלול נכשל.");
+      } else if (data.text?.trim()) {
+        sendMessage(data.text);
+      }
+    } catch {
+      chatInput.placeholder = "כתבו הודעה למנהל...";
+      addHtmlMessage("system", "שגיאת תקשורת בתמלול.");
+    }
+  };
+
+  // simple voice-activity detection: stop ~1.4s after speech goes quiet
+  vadCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const source = vadCtx.createMediaStreamSource(recStream);
+  const analyser = vadCtx.createAnalyser();
+  analyser.fftSize = 512;
+  source.connect(analyser);
+  const buf = new Uint8Array(analyser.fftSize);
+  let spoke = false;
+  let quietMs = 0;
+  let lastTick = performance.now();
+  const startedAt = lastTick;
+
+  const vadTick = () => {
+    if (!mediaRecorder || mediaRecorder.state !== "recording") return;
+    const now = performance.now();
+    const dtMs = now - lastTick;
+    lastTick = now;
+    analyser.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (const v of buf) { const d = (v - 128) / 128; sum += d * d; }
+    const rms = Math.sqrt(sum / buf.length);
+    if (rms > 0.03) { spoke = true; quietMs = 0; } else { quietMs += dtMs; }
+    const tooLong = now - startedAt > 12000;
+    const doneTalking = spoke && quietMs > 1400;
+    const gaveUp = !spoke && now - startedAt > 6000;
+    if (tooLong || doneTalking || gaveUp) {
+      if (!spoke) { cleanupRecording(); mediaRecorder = null; setListeningUI(false); return; }
+      mediaRecorder.stop();
       return;
     }
-    window.speechSynthesis?.cancel(); // don't transcribe David's own voice
-    isSpeaking = false;
+    setTimeout(vadTick, 90);
+  };
+
+  mediaRecorder.start();
+  setListeningUI(true);
+  setTimeout(vadTick, 90);
+}
+
+function cleanupRecording() {
+  recStream?.getTracks().forEach((t) => t.stop());
+  recStream = null;
+  vadCtx?.close().catch(() => {});
+  vadCtx = null;
+}
+
+// --- Unified entry points ---
+function startVoiceInput() {
+  if (listening) return;
+  stopVoice(); // don't transcribe the avatar's own voice
+  if (recognition) {
     try { recognition.start(); } catch { /* already starting */ }
+  } else if (CAN_RECORD) {
+    startRecording();
+  }
+}
+
+function stopVoiceInput() {
+  if (recognition && listening) recognition.stop();
+  if (mediaRecorder?.state === "recording") mediaRecorder.stop();
+}
+
+if (HAS_VOICE_INPUT) {
+  chatMic.addEventListener("click", () => {
+    if (listening) stopVoiceInput();
+    else startVoiceInput();
   });
 } else {
   chatMic.classList.add("unsupported");
   chatCont.classList.add("unsupported");
+}
+
+// --- Recognition-language selector (affects native recognition only) ---
+const langSelect = document.getElementById("lang-select");
+if (langSelect) {
+  langSelect.value = srLang;
+  langSelect.addEventListener("change", () => {
+    srLang = langSelect.value;
+    localStorage.setItem("managerLang", srLang);
+    if (recognition) recognition.lang = SR_LANGS[srLang] || "he-IL";
+  });
 }
 
 // ---------- Opening greeting ----------
@@ -894,8 +1049,8 @@ window.addEventListener("pointerdown", greetVisitor, { once: true });
 window.addEventListener("keydown", greetVisitor, { once: true });
 renderer.xr.addEventListener("sessionstart", greetVisitor);
 
-// 3D mic button inside VR (only when speech recognition exists)
-if (SpeechRec) {
+// 3D mic button inside VR (native recognition or server-side Whisper)
+if (HAS_VOICE_INPUT) {
   const micTex = makeTextTexture("🎤 דברו אליי", 640, 110, "bold 46px Arial", "#5c1e1e", "#ffd9d9");
   const micBtn = new THREE.Mesh(
     new THREE.BoxGeometry(0.72, 0.13, 0.025),
@@ -910,13 +1065,8 @@ if (SpeechRec) {
 
 function activateButton(obj) {
   if (obj.userData.action === "mic") {
-    if (recognition && !listening) {
-      window.speechSynthesis?.cancel();
-      isSpeaking = false;
-      try { recognition.start(); } catch { /* already starting */ }
-    } else if (recognition) {
-      recognition.stop();
-    }
+    if (listening) stopVoiceInput();
+    else startVoiceInput();
     return;
   }
   if (obj.userData.question) sendMessage(obj.userData.question);

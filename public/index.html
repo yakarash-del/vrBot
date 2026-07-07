@@ -101,7 +101,17 @@
       font-size: 17px;
       line-height: 1;
     }
-    #chat-cont { margin-inline-start: auto; }
+    #lang-select {
+      margin-inline-start: auto;
+      background: rgba(10, 14, 22, 0.9);
+      color: #cbd5f5;
+      border: 1px solid rgba(120, 160, 255, 0.3);
+      border-radius: 6px;
+      font-size: 12px;
+      padding: 3px 4px;
+      cursor: pointer;
+    }
+    #chat-cont { margin-inline-start: 0; }
     #chat-tts.off, #chat-cont.off { opacity: 0.35; }
     #chat-cont.unsupported { display: none; }
     #admin-link { text-decoration: none; font-size: 15px; opacity: 0.7; }
@@ -127,6 +137,11 @@
   <div id="chat-ui">
     <div id="chat-header">
       <span class="dot"></span> <span id="header-title">שיחה עם הדמות</span>
+      <select id="lang-select" title="שפת זיהוי הדיבור">
+        <option value="he">עב</option>
+        <option value="en">EN</option>
+        <option value="ar">ع</option>
+      </select>
       <button id="chat-cont" title="שיחה רציפה: המיקרופון נפתח שוב אוטומטית אחרי כל תשובה">🎙️</button>
       <button id="chat-tts" title="הפעלה/כיבוי קול">🔊</button>
       <a id="admin-link" href="/admin.html" title="מסך ניהול">⚙️</a>
