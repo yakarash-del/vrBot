@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>חדר המנהל הווירטואלי</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow: hidden; font-family: "Segoe UI", Arial, sans-serif; background: #111; }
+    #app { width: 100vw; height: 100vh; }
+
+    #chat-ui {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      width: 380px;
+      max-width: calc(100vw - 40px);
+      background: rgba(20, 24, 34, 0.88);
+      border: 1px solid rgba(120, 160, 255, 0.35);
+      border-radius: 14px;
+      backdrop-filter: blur(8px);
+      color: #eef2ff;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+    }
+    #chat-header {
+      padding: 10px 14px;
+      font-weight: 600;
+      border-bottom: 1px solid rgba(120, 160, 255, 0.25);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #chat-header .dot { width: 10px; height: 10px; border-radius: 50%; background: #4ade80; }
+    #chat-log {
+      height: 220px;
+      overflow-y: auto;
+      padding: 10px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      font-size: 14px;
+    }
+    .msg { padding: 8px 10px; border-radius: 10px; line-height: 1.45; max-width: 90%; }
+    .msg.user { background: #2b3a5e; align-self: flex-start; }
+    .msg.manager { background: #1f3d2e; align-self: flex-end; }
+    .msg.system { background: transparent; color: #93a4c8; font-size: 12px; align-self: center; }
+    #chat-input-row {
+      display: flex;
+      gap: 8px;
+      padding: 10px 14px;
+      border-top: 1px solid rgba(120, 160, 255, 0.25);
+    }
+    #chat-input {
+      flex: 1;
+      padding: 9px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(120, 160, 255, 0.3);
+      background: rgba(10, 14, 22, 0.9);
+      color: #eef2ff;
+      font-size: 14px;
+      outline: none;
+    }
+    #chat-send {
+      padding: 9px 16px;
+      border-radius: 8px;
+      border: none;
+      background: #3b82f6;
+      color: white;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    #chat-send:disabled { background: #334155; cursor: wait; }
+    #chat-mic {
+      padding: 9px 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(120, 160, 255, 0.3);
+      background: rgba(10, 14, 22, 0.9);
+      color: #eef2ff;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+    }
+    #chat-mic.listening {
+      background: #b91c1c;
+      border-color: #ef4444;
+      animation: micPulse 1.1s ease-in-out infinite;
+    }
+    #chat-mic.unsupported { display: none; }
+    @keyframes micPulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+      50% { box-shadow: 0 0 0 9px rgba(239, 68, 68, 0); }
+    }
+    #chat-tts, #chat-cont {
+      background: none;
+      border: none;
+      color: #cbd5f5;
+      cursor: pointer;
+      font-size: 17px;
+      line-height: 1;
+    }
+    #chat-cont { margin-inline-start: auto; }
+    #chat-tts.off, #chat-cont.off { opacity: 0.35; }
+    #chat-cont.unsupported { display: none; }
+    #admin-link { text-decoration: none; font-size: 15px; opacity: 0.7; }
+    #admin-link:hover { opacity: 1; }
+    #hint {
+      position: fixed;
+      top: 14px;
+      right: 20px;
+      color: #cbd5f5;
+      background: rgba(20, 24, 34, 0.7);
+      padding: 8px 14px;
+      border-radius: 10px;
+      font-size: 13px;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="hint">🕶️ מחוברים עם Quest? לחצו על ENTER VR למטה · במחשב: גררו עם העכבר להסתכל סביב</div>
+
+  <div id="chat-ui">
+    <div id="chat-header">
+      <span class="dot"></span> <span id="header-title">שיחה עם הדמות</span>
+      <button id="chat-cont" title="שיחה רציפה: המיקרופון נפתח שוב אוטומטית אחרי כל תשובה">🎙️</button>
+      <button id="chat-tts" title="הפעלה/כיבוי קול">🔊</button>
+      <a id="admin-link" href="/admin.html" title="מסך ניהול">⚙️</a>
+    </div>
+    <div id="chat-log">
+      <div class="msg system">ברוכים הבאים למשרד. אפשר לכתוב לדוד כל שאלה.</div>
+    </div>
+    <div id="chat-input-row">
+      <input id="chat-input" type="text" placeholder="כתבו הודעה למנהל..." autocomplete="off" />
+      <button id="chat-mic" title="דברו אל המנהל">🎤</button>
+      <button id="chat-send">שלח</button>
+    </div>
+  </div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
