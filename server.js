@@ -288,11 +288,42 @@ async function getSttWorker() {
   return sttStarting;
 }
 
+// Cloud transcription via Groq (free tier) — the right choice for hosted
+// deployments like Render, where local Whisper can't run. Set GROQ_API_KEY.
+async function groqTranscribe(audioBuffer) {
+  const form = new FormData();
+  form.append("file", new Blob([audioBuffer], { type: "audio/webm" }), "audio.webm");
+  form.append("model", "whisper-large-v3");
+  form.append("response_format", "json");
+  const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    body: form,
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Groq ${res.status}: ${body.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  return { text: data.text || "", language: data.language };
+}
+
 app.post(
   "/api/stt",
   express.raw({ type: ["audio/*", "application/octet-stream"], limit: "20mb" }),
   async (req, res) => {
     if (!req.body?.length) return res.status(400).json({ error: "no audio" });
+
+    // preferred path when a Groq key is configured (hosted deployments)
+    if (process.env.GROQ_API_KEY) {
+      try {
+        const result = await groqTranscribe(req.body);
+        return res.json(result);
+      } catch (e) {
+        console.error("Groq STT error:", e.message);
+        return res.status(502).json({ error: "התמלול בענן נכשל: " + e.message });
+      }
+    }
 
     let worker;
     try {

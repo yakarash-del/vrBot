@@ -4,11 +4,13 @@ audio files whose paths arrive on stdin (one per line), replying with one
 JSON line per request: {"text": "..."} or {"error": "..."}.
 Multilingual - auto-detects Hebrew / English / Arabic and more."""
 import json
+import os
 import sys
 
 from faster_whisper import WhisperModel
 
-model = WhisperModel("small", device="cpu", compute_type="int8")
+# WHISPER_MODEL: tiny / base / small (default) / medium - smaller = faster, less accurate
+model = WhisperModel(os.environ.get("WHISPER_MODEL", "small"), device="cpu", compute_type="int8")
 print(json.dumps({"ready": True}), flush=True)
 
 for line in sys.stdin:
